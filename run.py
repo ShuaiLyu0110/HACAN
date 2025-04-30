@@ -5,7 +5,7 @@ from meter.modules import METERTransformerSS
 from data import F30kDataModule, MscocoDataModule
 import torch
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+#os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 
 
 @ex.automain

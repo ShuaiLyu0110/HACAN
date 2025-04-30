@@ -1,5 +1,5 @@
 import numpy as np
-#import numpy
+import numpy
 
 
 def i2t_SCAN(sims, npts=None, return_ranks=False, fold5=False):
