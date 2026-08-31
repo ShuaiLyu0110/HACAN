@@ -40,7 +40,7 @@ def config():
     # Text Setting
     #vqav2_label_size = 3129
     max_text_len = 32
-    tokenizer = "/home/ls/bert-base-uncased"
+    tokenizer = "bert-base-uncased"
     vocab_size = 30522
     whole_word_masking = False # note that whole_word_masking does not work for RoBERTa
     mlm_prob = 0.15
@@ -58,8 +58,8 @@ def config():
     drop_rate = 0.1
 
     # Optimizer Setting
-    optim_type = "adamw"
-    learning_rate = 1e-4
+    optim_type = "adam"
+    learning_rate = 1e-5
     lr_update = 10
     weight_decay = 0.01
     decay_power = 1
@@ -78,7 +78,7 @@ def config():
     fast_dev_run = False
     val_check_interval = 1.0
     test_only = False
-    checkpoint = '/data3/lihaoxuan/New_Time/TKDE/github/runs/i2t_freeze/epoch=68-step=172499-v1.ckpt'
+    checkpoint = ""
 
     # below params varies with the environment
     data_root = '/data1/lihaoxuan/orignal-datasets/'
@@ -101,8 +101,10 @@ def config():
     activation = 'leaky_relu'  # tanh / relu / leaky_relu
     experiment_name = ''
     fold5 = False
-    save_path=''
-    # save_path='runs/i2t_freeze_f30k_last_but_one_t2i'
+    save_path = 'runs/f30k'
+    freeze_backbone_epochs = 10
+    inference_topk = 50
+    global_loss_weight = 1.0
     focal_type = 'prob'
 
 
@@ -127,7 +129,7 @@ def coco_config():
     # Text Setting
     #vqav2_label_size = 3129
     max_text_len = 32
-    tokenizer = "/home/ls/bert-base-uncased"
+    tokenizer = "bert-base-uncased"
     vocab_size = 30522
     whole_word_masking = False # note that whole_word_masking does not work for RoBERTa
     mlm_prob = 0.15
@@ -145,8 +147,8 @@ def coco_config():
     drop_rate = 0.1
 
     # Optimizer Setting
-    optim_type = "adamw"
-    learning_rate = 1e-4
+    optim_type = "adam"
+    learning_rate = 1e-5
     lr_update = 10
     weight_decay = 0.01
     decay_power = 1
@@ -165,7 +167,7 @@ def coco_config():
     fast_dev_run = False
     val_check_interval = 1.0
     test_only = False
-    checkpoint = '/data3/lihaoxuan/New_Time/TKDE/github/runs/i2t_freeze/last.ckpt'
+    checkpoint = ""
 
     # below params varies with the environment
     data_root = '/data1/lihaoxuan/orignal-datasets/'
@@ -187,6 +189,8 @@ def coco_config():
     activation = 'leaky_relu'
     experiment_name = ''
     fold5 = False
-    save_path='runs/i2t_freeze_coco_last_layers'
+    save_path = 'runs/coco'
+    freeze_backbone_epochs = 10
+    inference_topk = 50
+    global_loss_weight = 1.0
     focal_type = 'prob'
-

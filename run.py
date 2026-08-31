@@ -1,7 +1,7 @@
 import copy
 import pytorch_lightning as pl
 from meter.config import ex
-from meter.modules import METERTransformerSS
+from meter.modules import HACAN
 from data import F30kDataModule, MscocoDataModule
 import torch
 import os
@@ -20,15 +20,18 @@ def main(_config):
     else:
         dm = MscocoDataModule(_config)
 
-    model = METERTransformerSS(_config)
+    model = HACAN(_config)
 
     if _config['test_only']:
-        ckpt = torch.load(_config['checkpoint'], map_location="cuda:0")
-        model.load_state_dict(ckpt['state_dict'])
+        if not _config['checkpoint']:
+            raise ValueError("checkpoint must be provided when test_only=True")
+        ckpt = torch.load(_config['checkpoint'], map_location="cpu")
+        model.load_state_dict(ckpt.get('state_dict', ckpt))
 
     exp_name = f'{_config["exp_name"]}'
 
     os.makedirs(_config["log_dir"], exist_ok=True)
+    os.makedirs(_config["save_path"], exist_ok=True)
     
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         save_top_k=5,
@@ -45,26 +48,19 @@ def main(_config):
 
     callbacks = [checkpoint_callback]
 
-    num_gpus = (
-        _config["num_gpus"]
-        if isinstance(_config["num_gpus"], int)
-        else len(_config["num_gpus"])
-    )
-
     trainer = pl.Trainer(
-        gpus=[0],
+        gpus=_config["num_gpus"],
         precision=_config["precision"],
         #accelerator="ddp",s
         # accelerator='ddp',
         # strategy='ddp',
-        benchmark=True,
+        benchmark=False,
         deterministic=True,
         max_epochs=_config["max_epoch"],
         callbacks=callbacks,
         logger=logger,
         #replace_sampler_ddp=False,
         log_every_n_steps=10,
-        flush_logs_every_n_steps=10,
         weights_summary="top",
         val_check_interval=_config["val_check_interval"],
         # gradient_clip_val=2.0
@@ -77,4 +73,3 @@ def main(_config):
         trainer.fit(model, datamodule=dm)
     else:
         trainer.test(model, datamodule=dm)
-

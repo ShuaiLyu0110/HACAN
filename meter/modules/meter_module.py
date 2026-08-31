@@ -10,10 +10,9 @@ from meter.modules.visual_encoder import Visual_Enconder
 from meter.modules.textual_encoder import Textual_Enconder
 
 
-def freeze_layers(model, bool):
-    for child in model.children():
-        for param in child.parameters():
-            param.requires_grad = bool
+def set_trainable(model, trainable):
+    for parameter in model.parameters():
+        parameter.requires_grad = trainable
 
 
 class METERTransformerSS(pl.LightningModule):
@@ -53,25 +52,9 @@ class METERTransformerSS(pl.LightningModule):
 
         self.text_transformer = BertModel.from_pretrained(config['tokenizer'])
 
-        freeze_layers(self.text_transformer.encoder, False)
-        freeze_layers(self.text_transformer.embeddings, False)
-        freeze_layers(self.text_transformer.pooler, False)
-        freeze_layers(self.convnexts, False)
-
-    def adjust_k(self):
-        """
-            Update loss hyper-parameter k
-            linearly from intial_k to 1 according to
-            the number of epochs
-        """
-        self.iteration += 1
-
-        if self.max_violation:
-            self.k = 1
-            return 1.
-
-        self.k = (1.-self.beta**np.float(self.iteration))
-        return self.k
+        backbone_trainable = config.get("freeze_backbone_epochs", 10) == 0
+        set_trainable(self.text_transformer, backbone_trainable)
+        set_trainable(self.convnexts, backbone_trainable)
 
     def infer(
         self,
@@ -269,6 +252,14 @@ class METERTransformerSS(pl.LightningModule):
 
         return total_loss
 
+    def on_train_epoch_start(self):
+        """Freeze both pretrained backbones for exactly the first 10 epochs."""
+        trainable = self.current_epoch >= self.hparams.config.get(
+            "freeze_backbone_epochs", 10
+        )
+        set_trainable(self.text_transformer, trainable)
+        set_trainable(self.convnexts, trainable)
+
     def training_epoch_end(self, outs):
         pass
 
@@ -280,12 +271,6 @@ class METERTransformerSS(pl.LightningModule):
     def validation_epoch_end(self, outs):
         if self.current_epoch!=0:
             meter_utils.epoch_eval_irtr(self)
-
-        if self.current_epoch >= 10:
-            freeze_layers(self.convnexts, True)
-            freeze_layers(self.text_transformer.encoder, True)
-            freeze_layers(self.text_transformer.embeddings, True)
-            freeze_layers(self.text_transformer.pooler, True)
 
     def test_step(self, batch, batch_idx):
         pass

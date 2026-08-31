@@ -1,44 +1,61 @@
 # HACAN
-The codes for our paper "**HACAN: Hybrid Attention-Driven Cross-Layer Alignment Network for Image-Text Retrieval**".
 
+Official implementation of **HACAN: Hybrid Attention-Driven Cross-Layer Alignment Network for Image-Text Retrieval**.
 
-## Introduction
-In the field of image-text matching and cross-modal retrieval, while there have been advancements in fine-grained retrieval techniques, current methods often focus solely on the direct connections between visual elements in images and textual keywords. This focus overlooks the complex semantic interactions between modalities, at both local and global levels, leading to semantic ambiguity. We introduce a **H**ybrid **A**ttention-Driven **C**ross-layer **A**lignment **N**etwork (**HACAN**), leveraging BERT and ConvNeXt to merge global and local strategies effectively, addressing semantic ambiguity and alignment issues. By proposing a global contrastive divergence loss, HACAN boosts the complementarity between vision and language, thereby enhancing the model's capability to distinguish between positive and negative samples. By incorporating hierarchical inference strategies, HACAN significantly improves retrieval efficiency. On the Flickr30K and MS-COCO datasets, HACAN surpasses state-of-the-art image-to-text retrieval methods by a margin of 5% to 8% in the Rsum metric.
+The revised implementation uses ConvNeXt-Base and BERT to extract mid/high-level features, Local Relationship Guidance (dual-stream semantic completion), Key Semantic Filter, Global Contrastive Divergence loss, and a coarse-to-fine Hierarchical Inference Strategy (HIS).
 
+## Setup
 
-## Preparation
-### Dependencies
-We recommended to use Anaconda for the following packages.
-- python >= 3.8
-- [torch](http://pytorch.org/) (>=1.8.1)
-- [lightning](https://lightning.ai/) (1.8.0)
-- [transformers](https://huggingface.co/docs/transformers) (4.24.0)
-- torchvision
-- opencv-python
+Python 3.8 is recommended.
 
-
-### Data
-The experimental dataset can be downloaded from [Flickr30K](http://shannon.cs.illinois.edu/DenotationGraph/) and [MSCOCO](http://mscoco.org/). We will subsequently release the experimental pre-trained model for public access. We refer to the path of extracted files as `$DATASET_PATH` and the storage location of the pre-trained model as `$MODEL_PATH`.
-
-
-## Evaluation
-Run `run.py` to evaluate the trained models on Flickr30K or MSCOCO.
 ```bash
-Test on Flickr30K:
-python run.py with data_root=`$DATASET_PATH` test_only=True checkpoint=`$MODEL_PATH`
-
-Test on MSCOCO:
-python run.py with coco_config data_root=`$DATASET_PATH` test_only=True checkpoint=`$MODEL_PATH`
+pip install -r requirements.txt
 ```
 
+Place the datasets under one root directory:
+
+```text
+DATA_ROOT/
+├── f30k/
+│   ├── images/
+│   └── dataset_flickr30k.json
+└── coco/
+    ├── images/{train2014,val2014}/
+    └── annotations/
+        ├── captions_train2014.json
+        ├── captions_val2014.json
+        ├── coco_train_ids.npy
+        ├── coco_dev_ids.npy
+        └── coco_test_ids.npy
+```
+
+BERT and ImageNet-22K ConvNeXt weights are downloaded automatically when they are not cached locally.
 
 ## Training
-Run `run.py` to train the model on Flickr30K or MSCOCO.
-```bash
-Train on Flickr30K:
-python run.py with data_root=`$DATASET_PATH` loss="GCD" 
 
-Train on MSCOCO:
-python run.py with coco_config data_root=`$DATASET_PATH` loss="GCD"
+The manuscript settings are the defaults: learning rate `1e-5`, batch size `64`, 30 epochs, margin `0.2`, backbone freezing for the first 10 epochs, and HIS `top-K=50`.
+
+```bash
+# Flickr30K
+python run.py with data_root=/path/to/DATA_ROOT direction=i2t save_path=runs/f30k_i2t
+python run.py with data_root=/path/to/DATA_ROOT direction=t2i save_path=runs/f30k_t2i
+
+# MS-COCO
+python run.py with coco_config data_root=/path/to/DATA_ROOT direction=i2t save_path=runs/coco_i2t
+python run.py with coco_config data_root=/path/to/DATA_ROOT direction=t2i save_path=runs/coco_t2i
 ```
 
+## Evaluation
+
+```bash
+python run.py with data_root=/path/to/DATA_ROOT test_only=True checkpoint=/path/to/model.ckpt direction=i2t
+python run.py with coco_config data_root=/path/to/DATA_ROOT test_only=True checkpoint=/path/to/model.ckpt direction=i2t
+```
+
+For MS-COCO 1K five-fold evaluation, append `fold5=True`. The default evaluates MS-COCO 5K. Use the same `direction` as the evaluated checkpoint.
+
+Run the lightweight implementation checks with:
+
+```bash
+python -m unittest discover -s tests -v
+```

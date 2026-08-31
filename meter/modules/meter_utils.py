@@ -180,7 +180,9 @@ def epoch_eval_irtr(pl_module, is_test=False):
             "recalls/tr_r10", tr_r10, pl_module.global_step
         )
     else:
-        compute_irtr_test_gl(pl_module, fold5=False)
+        compute_irtr_test_gl(
+            pl_module, fold5=pl_module.hparams.config.get("fold5", False)
+        )
         # compute_irtr_testv2(pl_module)
 
 

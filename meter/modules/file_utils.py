@@ -17,10 +17,17 @@ from hashlib import sha256
 import sys
 from io import open
 
-import boto3
 import requests
-from botocore.exceptions import ClientError
 from tqdm import tqdm
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+except ImportError:  # S3 support is optional; HACAN checkpoints use HTTPS/local paths.
+    boto3 = None
+
+    class ClientError(Exception):
+        pass
 
 try:
     from urllib.parse import urlparse
@@ -150,6 +157,8 @@ def s3_request(func):
 @s3_request
 def s3_etag(url):
     """Check ETag on S3 object."""
+    if boto3 is None:
+        raise ImportError("boto3 is required only for s3:// model paths")
     s3_resource = boto3.resource("s3")
     bucket_name, s3_path = split_s3_path(url)
     s3_object = s3_resource.Object(bucket_name, s3_path)
@@ -159,6 +168,8 @@ def s3_etag(url):
 @s3_request
 def s3_get(url, temp_file):
     """Pull a file directly from S3."""
+    if boto3 is None:
+        raise ImportError("boto3 is required only for s3:// model paths")
     s3_resource = boto3.resource("s3")
     bucket_name, s3_path = split_s3_path(url)
     s3_resource.Bucket(bucket_name).download_fileobj(s3_path, temp_file)

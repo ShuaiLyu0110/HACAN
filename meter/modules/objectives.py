@@ -15,8 +15,15 @@ from .dist_utils import all_gather
 
 from evaluation import i2t_SCAN, t2i_SCAN
 import sys
+import time
 
 from meter.modules.eval_gl import i2t_gl, t2i_gl
+from meter.modules.hacan import (
+    dual_stream_completion_score,
+    global_contrastive_divergence,
+    hacan_similarity,
+    key_semantic_filter_score,
+)
 
 
 def compute_mlm(pl_module, batch):
@@ -524,6 +531,7 @@ def cosine_similarity(x1, x2, dim=1, eps=1e-8):
     # return (w12 / (w1 * w2).clamp(min=eps)).squeeze()
     return (w12 / (w1 * w2).clamp(min=eps))
 
+
 def xattn_score_i2t(images, captions, cap_lens, lambda_softmax):
     """
     Images: (batch_size, n_regions, d) matrix of images
@@ -705,24 +713,11 @@ def xattn_score_BFAN(images, captions, cap_lens, opt):
 
 
 def compute_SCAN(im, s, s_l, add_data, margin, direction, lambda_softmax):
-        (image_feats_m, text_feats_m, pl_module) = add_data
+        (image_feats_m, text_feats_m, _) = add_data
 
-        # compute image-sentence score matrix
-        if direction == 't2i':
-
-            scores_2 = xattn_score_t2i_new(im, s, s_l, pl_module)
-            scores_3 = xattn_score_t2i(im, text_feats_m, s_l, lambda_softmax)
-            scores_4 = xattn_score_t2i(image_feats_m, s, s_l, lambda_softmax)
-            scores = scores_2 + scores_3 + scores_4
-
-        elif direction == 'i2t':
-
-            scores_2 = xattn_score_i2t_new(im, s, s_l, pl_module)
-            scores_3 = xattn_score_i2t(im, text_feats_m, s_l, lambda_softmax)
-            scores_4 = xattn_score_i2t(image_feats_m, s, s_l, lambda_softmax)
-            scores = scores_2 + scores_3 + scores_4
-        else:
-            raise ValueError("unknown first norm type")
+        scores = hacan_similarity(
+            im, s, image_feats_m, text_feats_m, s_l, direction
+        )
         diagonal = scores.diag().view(im.size(0), 1)
         d1 = diagonal.expand_as(scores)
         d2 = diagonal.t().expand_as(scores)
@@ -735,25 +730,25 @@ def compute_SCAN(im, s, s_l, add_data, margin, direction, lambda_softmax):
         cost_im = (margin + scores - d2).clamp(min=0)
 
         # clear diagonals
-        mask = torch.eye(scores.size(0)) > .5
-        I = mask
-        if torch.cuda.is_available():
-            I = I.cuda()
-        cost_s = cost_s.masked_fill_(I, 0)
-        cost_im = cost_im.masked_fill_(I, 0)
+        diagonal_mask = torch.eye(
+            scores.size(0), dtype=torch.bool, device=scores.device
+        )
+        cost_s = cost_s.masked_fill(diagonal_mask, 0)
+        cost_im = cost_im.masked_fill(diagonal_mask, 0)
 
         # cost_s_t = cost_s.sum()
         # cost_im_t = cost_im.sum()
         # k = pl_module.adjust_k()
         # cost_all_k = (cost_s_t + cost_im_t) * (1. - k)
 
-        text_negative_idx = cost_s.max(1)[1]
-        img_negative_idx = cost_im.max(0)[1]
+        negative_scores = scores.masked_fill(diagonal_mask, float("-inf"))
+        text_negative_idx = negative_scores.max(1)[1]
+        img_negative_idx = negative_scores.max(0)[1]
 
         # keep the maximum violating negative for each query
         cost_s = cost_s.max(1)[0]
         cost_im = cost_im.max(0)[0]
-        return cost_s.sum() + cost_im.sum(), text_negative_idx, img_negative_idx
+        return cost_s.mean() + cost_im.mean(), text_negative_idx, img_negative_idx
 
 
 def compute_irtr_my(pl_module, batch):
@@ -825,22 +820,15 @@ def compute_irtr_my(pl_module, batch):
         loss2 = i2t_t2i_loss
 
     elif loss_func == "GCD":
-        mask_ = (text_negative_idx == img_negative_idx)
-        lsc = (mask_ * (i_n_c_n + margin - i_c).clamp(min=0)).mean()
-        i2t_loss = (i_c_n + margin - i_c).clamp(min=0).mean()
-        t2i_loss = (i_n_c + margin - i_c).clamp(min=0).mean()
-        inter_loss = i2t_loss + t2i_loss + lsc  # intre-Model
+        loss2 = global_contrastive_divergence(
+            full_img_emb_aggr,
+            full_cap_emb_aggr,
+            text_negative_idx,
+            img_negative_idx,
+            margin,
+        )
 
-        la1 = (torch.abs(i_il_n - c_cl_n) - torch.tensor(0.2)).clamp(min=0).mean()
-        la2 = (torch.abs(i_iv_n - c_cv_n) - torch.tensor(0.2)).clamp(min=0).mean()
-
-        i2i_loss = (i_n_i + margin - i_c).clamp(min=0).mean() + la2
-        t2t_loss = (c_n_c + margin - i_c).clamp(min=0).mean() + la1
-        intra_loss = i2i_loss + t2t_loss  #  intra-Model
-
-        loss2 = inter_loss + intra_loss
-
-    loss = loss1 + loss2 * 10
+    loss = loss1 + loss2 * pl_module.hparams.config.get("global_loss_weight", 1.0)
 
     ret = {
         "irtr_loss": loss,
@@ -1004,6 +992,72 @@ def shard_xattn_t2i_new(images, captions, caplens, pl_module, shard_size=128):
     return d
 
 
+def _shard_hacan_score(
+    images, captions, caplens, pl_module, score_function, shard_size=128
+):
+    """Evaluate an HACAN similarity function in bounded GPU/CPU shards."""
+    num_image_shards = (len(images) - 1) // shard_size + 1
+    num_caption_shards = (len(captions) - 1) // shard_size + 1
+    scores = np.zeros((len(images), len(captions)), dtype=np.float32)
+    device = pl_module.device
+
+    for image_shard in range(num_image_shards):
+        image_start = shard_size * image_shard
+        image_end = min(shard_size * (image_shard + 1), len(images))
+        for caption_shard in range(num_caption_shards):
+            caption_start = shard_size * caption_shard
+            caption_end = min(shard_size * (caption_shard + 1), len(captions))
+            image_tensor = torch.as_tensor(
+                images[image_start:image_end], device=device
+            )
+            caption_tensor = torch.as_tensor(
+                captions[caption_start:caption_end], device=device
+            )
+            lengths = caplens[caption_start:caption_end]
+            shard_scores = score_function(image_tensor, caption_tensor, lengths)
+            scores[image_start:image_end, caption_start:caption_end] = (
+                shard_scores.detach().cpu().numpy()
+            )
+    return scores
+
+
+def shard_dual_stream(images, captions, caplens, pl_module, shard_size=128):
+    return _shard_hacan_score(
+        images,
+        captions,
+        caplens,
+        pl_module,
+        dual_stream_completion_score,
+        shard_size,
+    )
+
+
+def shard_ksf_i2t(images, captions, caplens, pl_module, shard_size=128):
+    return _shard_hacan_score(
+        images,
+        captions,
+        caplens,
+        pl_module,
+        lambda image, text, lengths: key_semantic_filter_score(
+            image, text, lengths, "i2t"
+        ),
+        shard_size,
+    )
+
+
+def shard_ksf_t2i(images, captions, caplens, pl_module, shard_size=128):
+    return _shard_hacan_score(
+        images,
+        captions,
+        caplens,
+        pl_module,
+        lambda image, text, lengths: key_semantic_filter_score(
+            image, text, lengths, "t2i"
+        ),
+        shard_size,
+    )
+
+
 @torch.no_grad()
 def compute_irtr_val(pl_module):
     val_dataloader = pl_module.trainer.datamodule.val_dataloader()
@@ -1038,16 +1092,16 @@ def compute_irtr_val(pl_module):
 
         # initialize the numpy arrays given the size of the embeddings
         if img_embs is None:
-            img_embs = np.zeros((len(val_dataloader.dataset), img_emb.size(1), img_emb.size(2)))
-            cap_embs = np.zeros((len(val_dataloader.dataset), cap_emb.size(1), cap_emb.size(2)))
+            img_embs = np.zeros((len(val_dataloader.dataset), img_emb.size(1), img_emb.size(2)), dtype=np.float32)
+            cap_embs = np.zeros((len(val_dataloader.dataset), cap_emb.size(1), cap_emb.size(2)), dtype=np.float32)
 
-            full_img_emb_aggrs = np.zeros((len(val_dataloader.dataset), full_img_emb_aggr.size(1)))
-            full_cap_emb_aggrs = np.zeros((len(val_dataloader.dataset), full_cap_emb_aggr.size(1)))
+            full_img_emb_aggrs = np.zeros((len(val_dataloader.dataset), full_img_emb_aggr.size(1)), dtype=np.float32)
+            full_cap_emb_aggrs = np.zeros((len(val_dataloader.dataset), full_cap_emb_aggr.size(1)), dtype=np.float32)
 
-            img_embs_2 = np.zeros((len(val_dataloader.dataset), img_emb_2.size(1), img_emb_2.size(2)))
-            cap_embs_2 = np.zeros((len(val_dataloader.dataset), cap_emb_2.size(1), cap_emb_2.size(2)))
+            img_embs_2 = np.zeros((len(val_dataloader.dataset), img_emb_2.size(1), img_emb_2.size(2)), dtype=np.float32)
+            cap_embs_2 = np.zeros((len(val_dataloader.dataset), cap_emb_2.size(1), cap_emb_2.size(2)), dtype=np.float32)
 
-            stc_lens = np.zeros(len(val_dataloader.dataset), dtype=np.int)
+            stc_lens = np.zeros(len(val_dataloader.dataset), dtype=int)
 
         # preserve the embeddings by copying from gpu and converting to numpy
         img_embs[ids] = img_emb.data.cpu().numpy().copy()
@@ -1058,7 +1112,7 @@ def compute_irtr_val(pl_module):
         full_img_emb_aggrs[ids] = full_img_emb_aggr.data.cpu().numpy().copy()
         full_cap_emb_aggrs[ids] = full_cap_emb_aggr.data.cpu().numpy().copy()
 
-        stc_lens[ids] = np.asarray(lengths, dtype=np.int)
+        stc_lens[ids] = np.asarray(lengths, dtype=int)
 
     img_embs = np.array([img_embs[i] for i in range(0, len(img_embs), 5)])
     img_embs_2 = np.array([img_embs_2[i] for i in range(0, len(img_embs_2), 5)])
@@ -1066,16 +1120,13 @@ def compute_irtr_val(pl_module):
     global_sims = np.matmul(full_img_emb_aggrs, full_cap_emb_aggrs.T)
 
     if pl_module.hparams.config["direction"] == 'i2t':
-
-        scores_2 = shard_xattn_i2t_new(img_embs, cap_embs, stc_lens, pl_module, shard_size=128)
-        scores_3 = shard_xattn_i2t(img_embs, cap_embs_2, stc_lens, pl_module.hparams.config["lambda_softmax"], shard_size=128)
-        scores_4 = shard_xattn_i2t(img_embs_2, cap_embs, stc_lens, pl_module.hparams.config["lambda_softmax"], shard_size=128)
+        scores_2 = shard_ksf_i2t(img_embs, cap_embs, stc_lens, pl_module, shard_size=128)
 
     else:
+        scores_2 = shard_ksf_t2i(img_embs, cap_embs, stc_lens, pl_module, shard_size=128)
 
-        scores_2 = shard_xattn_t2i_new(img_embs, cap_embs, stc_lens, pl_module, shard_size=128)
-        scores_3 = shard_xattn_t2i(img_embs, cap_embs_2, stc_lens, pl_module.hparams.config["lambda_softmax"], shard_size=128)
-        scores_4 = shard_xattn_t2i(img_embs_2, cap_embs, stc_lens, pl_module.hparams.config["lambda_softmax"], shard_size=128)
+    scores_3 = shard_dual_stream(img_embs_2, cap_embs, stc_lens, pl_module, shard_size=128)
+    scores_4 = shard_dual_stream(img_embs, cap_embs_2, stc_lens, pl_module, shard_size=128)
 
     sims_all = scores_2 + scores_3 + scores_4
 
@@ -1103,7 +1154,7 @@ def compute_irtr_val(pl_module):
     (r1i, r5i, r10i, r20i, r50i, r70i, r100i, medri, meanri) = t2i_SCAN(sims_all)
     print("sims_all: Image to text: %.1f, %.1f, %.1f, %.1f, %.1f, %.1f, %.1f" % (r1, r5, r10, r20, r50, r70, r100))
     print("sims_all: Text to image: %.1f, %.1f, %.1f, %.1f, %.1f, %.1f, %.1f" % (r1i, r5i, r10i, r20i, r50i, r70i, r100i))
-    pl_module.log('best_irtr', (r1 + r1i + r1_g + r1i_g))
+    pl_module.log('best_irtr', r1 + r5 + r10 + r1i + r5i + r10i)
     return (r1, r5, r10, r20, r50, r70, r100, r1i, r5i, r10i, r20i, r50i, r70i, r100i)
 
 
@@ -1145,16 +1196,16 @@ def compute_irtr_test_gl(pl_module, fold5=False):
 
         # initialize the numpy arrays given the size of the embeddings
         if img_embs is None:
-            img_embs = np.zeros((len(val_dataloader.dataset), img_emb.size(1), img_emb.size(2)))
-            cap_embs = np.zeros((len(val_dataloader.dataset), cap_emb.size(1), cap_emb.size(2)))
-            img_embs_2 = np.zeros((len(val_dataloader.dataset), img_emb_2.size(1), img_emb_2.size(2)))
-            cap_embs_2 = np.zeros((len(val_dataloader.dataset), cap_emb_2.size(1), cap_emb_2.size(2)))
+            img_embs = np.zeros((len(val_dataloader.dataset), img_emb.size(1), img_emb.size(2)), dtype=np.float32)
+            cap_embs = np.zeros((len(val_dataloader.dataset), cap_emb.size(1), cap_emb.size(2)), dtype=np.float32)
+            img_embs_2 = np.zeros((len(val_dataloader.dataset), img_emb_2.size(1), img_emb_2.size(2)), dtype=np.float32)
+            cap_embs_2 = np.zeros((len(val_dataloader.dataset), cap_emb_2.size(1), cap_emb_2.size(2)), dtype=np.float32)
 
             # global
-            full_img_emb_aggrs = np.zeros((len(val_dataloader.dataset), full_img_emb_aggr.size(1)))
-            full_cap_emb_aggrs = np.zeros((len(val_dataloader.dataset), full_cap_emb_aggr.size(1)))
+            full_img_emb_aggrs = np.zeros((len(val_dataloader.dataset), full_img_emb_aggr.size(1)), dtype=np.float32)
+            full_cap_emb_aggrs = np.zeros((len(val_dataloader.dataset), full_cap_emb_aggr.size(1)), dtype=np.float32)
 
-            stc_lens = np.zeros(len(val_dataloader.dataset), dtype=np.int)
+            stc_lens = np.zeros(len(val_dataloader.dataset), dtype=int)
 
         # preserve the embeddings by copying from gpu and converting to numpy
         img_embs[ids] = img_emb.data.cpu().numpy().copy()
@@ -1166,24 +1217,23 @@ def compute_irtr_test_gl(pl_module, fold5=False):
         full_img_emb_aggrs[ids] = full_img_emb_aggr.data.cpu().numpy().copy()
         full_cap_emb_aggrs[ids] = full_cap_emb_aggr.data.cpu().numpy().copy()
 
-        stc_lens[ids] = np.asarray(lengths, dtype=np.int)
+        stc_lens[ids] = np.asarray(lengths, dtype=int)
 
     img_lenghts = None
-    torch.cuda.synchronize()
-    timings = np.zeros(1,)
-    starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    starter.record()
+    if pl_module.device.type == "cuda":
+        torch.cuda.synchronize(pl_module.device)
+    start_time = time.perf_counter()
 
     if not fold5:
         if pl_module.hparams.config["direction"] == 'i2t':
             r, rt, sims = i2t_gl(full_img_emb_aggrs, full_cap_emb_aggrs, img_embs, cap_embs, img_embs_2, cap_embs_2,
-                                    img_lenghts, stc_lens, sim_function=shard_xattn_i2t,
-                                    sim_function_new=shard_xattn_i2t_new, pl_module=pl_module, fold5=-1, topk=50,
-                                    weight=0.2)
+                                    img_lenghts, stc_lens, sim_function=shard_dual_stream,
+                                    sim_function_new=shard_ksf_i2t, pl_module=pl_module, fold5=-1,
+                                    topk=pl_module.hparams.config["inference_topk"])
             ri, rti = t2i_gl(full_img_emb_aggrs, full_cap_emb_aggrs, img_embs, cap_embs, img_embs_2, cap_embs_2,
-                                img_lenghts, stc_lens, sim_function=shard_xattn_i2t,
-                                sim_function_new=shard_xattn_i2t_new, pl_module=pl_module, sims=sims, topk=50,
-                                weight=0.2)
+                                img_lenghts, stc_lens, sim_function=shard_dual_stream,
+                                sim_function_new=shard_ksf_i2t, pl_module=pl_module, sims=sims,
+                                topk=pl_module.hparams.config["inference_topk"])
             ar = (r[0] + r[1] + r[2]) / 3
             ari = (ri[0] + ri[1] + ri[2]) / 3
             rsum = r[0] + r[1] + r[2] + ri[0] + ri[1] + ri[2]
@@ -1193,14 +1243,15 @@ def compute_irtr_test_gl(pl_module, fold5=False):
             print("Image to text: %.1f %.1f %.1f %.1f %.1f, ndcg_rouge=%.4f, ndcg_spice=%.4f" % r)
             print("Average t2i Recall: %.1f" % ari)
             print("Text to image: %.1f %.1f %.1f %.1f %.1f, ndcg_rouge=%.4f, ndcg_spice=%.4f" % ri)
-            pl_module.log('best_irtr', (r[0] + ri[0]))
+            pl_module.log('best_irtr', rsum)
 
         elif pl_module.hparams.config["direction"] == 't2i':
             r, rt, sims = i2t_gl(full_img_emb_aggrs, full_cap_emb_aggrs, img_embs, cap_embs,
                                                   img_embs_2, cap_embs_2, img_lenghts, stc_lens,
-                                                  sim_function=shard_xattn_t2i, sim_function_new=shard_xattn_t2i_new,
-                                                  pl_module=pl_module, fold5=-1, topk=50, weight=0.2)
-            ri, rti = t2i_gl(full_img_emb_aggrs, full_cap_emb_aggrs, img_embs, cap_embs, img_embs_2, cap_embs_2, img_lenghts, stc_lens, sim_function=shard_xattn_t2i, sim_function_new=shard_xattn_t2i_new, pl_module=pl_module, sims=sims,topk=50, weight=0.2)
+                                                  sim_function=shard_dual_stream, sim_function_new=shard_ksf_t2i,
+                                                  pl_module=pl_module, fold5=-1,
+                                                  topk=pl_module.hparams.config["inference_topk"])
+            ri, rti = t2i_gl(full_img_emb_aggrs, full_cap_emb_aggrs, img_embs, cap_embs, img_embs_2, cap_embs_2, img_lenghts, stc_lens, sim_function=shard_dual_stream, sim_function_new=shard_ksf_t2i, pl_module=pl_module, sims=sims, topk=pl_module.hparams.config["inference_topk"])
 
             ar = (r[0] + r[1] + r[2]) / 3
             ari = (ri[0] + ri[1] + ri[2]) / 3
@@ -1211,7 +1262,7 @@ def compute_irtr_test_gl(pl_module, fold5=False):
             print("Image to text: %.1f %.1f %.1f %.1f %.1f, ndcg_rouge=%.4f, ndcg_spice=%.4f" % r)
             print("Average t2i Recall: %.1f" % ari)
             print("Text to image: %.1f %.1f %.1f %.1f %.1f, ndcg_rouge=%.4f, ndcg_spice=%.4f" % ri)
-            pl_module.log('best_irtr', (r[0] + ri[0]))
+            pl_module.log('best_irtr', rsum)
 
     else:
         # 5fold cross-validation, only for MSCOCO
@@ -1221,16 +1272,16 @@ def compute_irtr_test_gl(pl_module, fold5=False):
                 r, rt0, sims = i2t_gl(full_img_emb_aggrs[i * 5000:(i + 1) * 5000], full_cap_emb_aggrs[i * 5000:(i + 1) * 5000],
                                          img_embs[i * 5000:(i + 1) * 5000], cap_embs[i * 5000:(i + 1) * 5000],
                                          img_embs_2[i * 5000:(i + 1) * 5000], cap_embs_2[i * 5000:(i + 1) * 5000],
-                                        img_lenghts, stc_lens[i * 5000:(i + 1) * 5000], sim_function=shard_xattn_i2t,
-                                        sim_function_new=shard_xattn_i2t_new, pl_module=pl_module, fold5=-1, topk=50,
-                                        weight=0.2)
+                                        img_lenghts, stc_lens[i * 5000:(i + 1) * 5000], sim_function=shard_dual_stream,
+                                        sim_function_new=shard_ksf_i2t, pl_module=pl_module, fold5=-1,
+                                        topk=pl_module.hparams.config["inference_topk"])
                 print("Image to text: %.1f, %.1f, %.1f, %.1f, %.1f, ndcg_rouge=%.4f ndcg_spice=%.4f" % r)
                 ri, rti0 = t2i_gl(full_img_emb_aggrs[i * 5000:(i + 1) * 5000], full_cap_emb_aggrs[i * 5000:(i + 1) * 5000],
                                      img_embs[i * 5000:(i + 1) * 5000], cap_embs[i * 5000:(i + 1) * 5000],
                                      img_embs_2[i * 5000:(i + 1) * 5000], cap_embs_2[i * 5000:(i + 1) * 5000],
-                                    img_lenghts, stc_lens[i * 5000:(i + 1) * 5000], sim_function=shard_xattn_i2t,
-                                    sim_function_new=shard_xattn_i2t_new, pl_module=pl_module, sims=sims, topk=50,
-                                    weight=0.2)
+                                    img_lenghts, stc_lens[i * 5000:(i + 1) * 5000], sim_function=shard_dual_stream,
+                                    sim_function_new=shard_ksf_i2t, pl_module=pl_module, sims=sims,
+                                    topk=pl_module.hparams.config["inference_topk"])
                 print("Text to image: %.1f, %.1f, %.1f, %.1f, %.1f, ndcg_rouge=%.4f, ndcg_spice=%.4f" % ri)
 
                 if i == 0:
@@ -1245,14 +1296,14 @@ def compute_irtr_test_gl(pl_module, fold5=False):
             print("-----------------------------------")
             print("Mean metrics: ")
             mean_metrics = tuple(np.array(results).mean(axis=0).flatten())
-            print("rsum: %.1f" % (mean_metrics[16] * 6))
+            print("rsum: %.1f" % mean_metrics[16])
             print("Average i2t Recall: %.1f" % mean_metrics[14])
             print("Image to text: %.1f %.1f %.1f %.1f %.1f" %
                   mean_metrics[:5])
             print("Average t2i Recall: %.1f" % mean_metrics[15])
             print("Text to image: %.1f %.1f %.1f %.1f %.1f" %
                   mean_metrics[7:12])
-            pl_module.log('best_irtr', (mean_metrics[0] + mean_metrics[7]))
+            pl_module.log('best_irtr', mean_metrics[16])
 
         elif pl_module.hparams.config["direction"] == 't2i':
             results = []
@@ -1260,16 +1311,16 @@ def compute_irtr_test_gl(pl_module, fold5=False):
                 r, rt0, sims = i2t_gl(full_img_emb_aggrs[i * 5000:(i + 1) * 5000], full_cap_emb_aggrs[i * 5000:(i + 1) * 5000],
                                          img_embs[i * 5000:(i + 1) * 5000], cap_embs[i * 5000:(i + 1) * 5000],
                                          img_embs_2[i * 5000:(i + 1) * 5000], cap_embs_2[i * 5000:(i + 1) * 5000],
-                                        img_lenghts, stc_lens[i * 5000:(i + 1) * 5000], sim_function=shard_xattn_t2i,
-                                        sim_function_new=shard_xattn_t2i_new, pl_module=pl_module, fold5=i, topk=20,
-                                        weight=0.2)
+                                        img_lenghts, stc_lens[i * 5000:(i + 1) * 5000], sim_function=shard_dual_stream,
+                                        sim_function_new=shard_ksf_t2i, pl_module=pl_module, fold5=i,
+                                        topk=pl_module.hparams.config["inference_topk"])
                 print("Image to text: %.1f, %.1f, %.1f, %.1f, %.1f, ndcg_rouge=%.4f ndcg_spice=%.4f" % r)
                 ri, rti0 = t2i_gl(full_img_emb_aggrs[i * 5000:(i + 1) * 5000], full_cap_emb_aggrs[i * 5000:(i + 1) * 5000],
                                      img_embs[i * 5000:(i + 1) * 5000], cap_embs[i * 5000:(i + 1) * 5000],
                                      img_embs_2[i * 5000:(i + 1) * 5000], cap_embs_2[i * 5000:(i + 1) * 5000],
-                                    img_lenghts, stc_lens[i * 5000:(i + 1) * 5000], sim_function=shard_xattn_t2i,
-                                    sim_function_new=shard_xattn_t2i_new, pl_module=pl_module, sims=sims, topk=20,
-                                    weight=0.2)
+                                    img_lenghts, stc_lens[i * 5000:(i + 1) * 5000], sim_function=shard_dual_stream,
+                                    sim_function_new=shard_ksf_t2i, pl_module=pl_module, sims=sims,
+                                    topk=pl_module.hparams.config["inference_topk"])
 
                 if i == 0:
                     rt, rti = rt0, rti0
@@ -1282,25 +1333,19 @@ def compute_irtr_test_gl(pl_module, fold5=False):
             print("-----------------------------------")
             print("Mean metrics: ")
             mean_metrics = tuple(np.array(results).mean(axis=0).flatten())
-            print("rsum: %.1f" % (mean_metrics[16] * 6))
+            print("rsum: %.1f" % mean_metrics[16])
             print("Average i2t Recall: %.1f" % mean_metrics[14])
             print("Image to text: %.1f %.1f %.1f %.1f %.1f" %
                   mean_metrics[:5])
             print("Average t2i Recall: %.1f" % mean_metrics[15])
             print("Text to image: %.1f %.1f %.1f %.1f %.1f" %
                   mean_metrics[7:12])
-            pl_module.log('best_irtr', (mean_metrics[0] + mean_metrics[7]))
+            pl_module.log('best_irtr', mean_metrics[16])
 
-    ender.record()
-    torch.cuda.synchronize()
-    curr_time = starter.elapsed_time(ender)
-    timings[0] = curr_time
-    mean_syn = np.sum(timings) / 1
-    std_syn = np.std(timings)
-    mean_fps = 1000. / mean_syn
-    print(' * Mean@1 {mean_syn:.3f}ms\n Std@5 {std_syn:.3f}ms\n FPS@1 {mean_fps:.2f}\n'.format(mean_syn=mean_syn,
-                                                                                         std_syn=std_syn,
-                                                                                         mean_fps=mean_fps))
+    if pl_module.device.type == "cuda":
+        torch.cuda.synchronize(pl_module.device)
+    elapsed_ms = (time.perf_counter() - start_time) * 1000
+    print("HIS inference time: %.3f ms" % elapsed_ms)
 
 
 @torch.no_grad()
@@ -1340,16 +1385,16 @@ def compute_irtr_testv2(pl_module):
 
         # initialize the numpy arrays given the size of the embeddings
         if img_embs is None:
-            img_embs = np.zeros((len(test_dataloader.dataset), img_emb.size(1), img_emb.size(2)))
-            cap_embs = np.zeros((len(test_dataloader.dataset), cap_emb.size(1), cap_emb.size(2)))
+            img_embs = np.zeros((len(test_dataloader.dataset), img_emb.size(1), img_emb.size(2)), dtype=np.float32)
+            cap_embs = np.zeros((len(test_dataloader.dataset), cap_emb.size(1), cap_emb.size(2)), dtype=np.float32)
 
-            full_img_emb_aggrs = np.zeros((len(test_dataloader.dataset), full_img_emb_aggr.size(1)))
-            full_cap_emb_aggrs = np.zeros((len(test_dataloader.dataset), full_cap_emb_aggr.size(1)))
+            full_img_emb_aggrs = np.zeros((len(test_dataloader.dataset), full_img_emb_aggr.size(1)), dtype=np.float32)
+            full_cap_emb_aggrs = np.zeros((len(test_dataloader.dataset), full_cap_emb_aggr.size(1)), dtype=np.float32)
 
-            img_embs_2 = np.zeros((len(test_dataloader.dataset), img_emb_2.size(1), img_emb_2.size(2)))
-            cap_embs_2 = np.zeros((len(test_dataloader.dataset), cap_emb_2.size(1), cap_emb_2.size(2)))
+            img_embs_2 = np.zeros((len(test_dataloader.dataset), img_emb_2.size(1), img_emb_2.size(2)), dtype=np.float32)
+            cap_embs_2 = np.zeros((len(test_dataloader.dataset), cap_emb_2.size(1), cap_emb_2.size(2)), dtype=np.float32)
 
-            stc_lens = np.zeros(len(test_dataloader.dataset), dtype=np.int)
+            stc_lens = np.zeros(len(test_dataloader.dataset), dtype=int)
 
         # preserve the embeddings by copying from gpu and converting to numpy
         img_embs[ids] = img_emb.data.cpu().numpy().copy()
@@ -1361,7 +1406,7 @@ def compute_irtr_testv2(pl_module):
         full_cap_emb_aggrs[ids] = full_cap_emb_aggr.data.cpu().numpy().copy()
 
 
-        stc_lens[ids] = np.asarray(lengths, dtype=np.int)
+        stc_lens[ids] = np.asarray(lengths, dtype=int)
 
     img_embs = np.array([img_embs[i] for i in range(0, len(img_embs), 5)])
     img_embs_2 = np.array([img_embs_2[i] for i in range(0, len(img_embs_2), 5)])
@@ -1375,14 +1420,13 @@ def compute_irtr_testv2(pl_module):
     starter.record()
 
     if pl_module.hparams.config["direction"] == 'i2t':
-        scores_2 = shard_xattn_i2t_new(img_embs, cap_embs, stc_lens, pl_module, shard_size=128)
-        scores_3 = shard_xattn_i2t(img_embs_2, cap_embs, stc_lens, pl_module.hparams.config["lambda_softmax"], shard_size=128)
-        scores_4 = shard_xattn_i2t(img_embs, cap_embs_2, stc_lens, pl_module.hparams.config["lambda_softmax"], shard_size=128)
+        scores_2 = shard_ksf_i2t(img_embs, cap_embs, stc_lens, pl_module, shard_size=128)
 
     else:
-        scores_2 = shard_xattn_t2i_new(img_embs, cap_embs, stc_lens, pl_module, shard_size=128)
-        scores_3 = shard_xattn_t2i(img_embs_2, cap_embs, stc_lens, pl_module.hparams.config["lambda_softmax"], shard_size=128)
-        scores_4 = shard_xattn_t2i(img_embs, cap_embs_2, stc_lens, pl_module.hparams.config["lambda_softmax"], shard_size=128)
+        scores_2 = shard_ksf_t2i(img_embs, cap_embs, stc_lens, pl_module, shard_size=128)
+
+    scores_3 = shard_dual_stream(img_embs_2, cap_embs, stc_lens, pl_module, shard_size=128)
+    scores_4 = shard_dual_stream(img_embs, cap_embs_2, stc_lens, pl_module, shard_size=128)
 
     sims_all = scores_2 + scores_3 + scores_4
 
